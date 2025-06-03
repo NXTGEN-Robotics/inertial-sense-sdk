@@ -196,7 +196,7 @@ void InertialSenseROS::initializeROS()
     if (rs_.diagnostics.enabled)
     {
         rs_.diagnostics.pub_diagnostics = nh_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("diagnostics", 1);
-        diagnostics_timer_ = nh_->create_timer(0.5s, std::bind(InertialSenseROS::diagnostics_callback, this)); // 2 Hz
+        diagnostics_timer_ = nh_->create_wall_timer(0.5s, std::bind(InertialSenseROS::diagnostics_callback, this)); // 2 Hz
     }
 
     data_stream_timer_ = nh_->create_wall_timer(1s, [this]() { this->configure_data_streams(false); });

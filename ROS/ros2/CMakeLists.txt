@@ -35,25 +35,48 @@ find_file(BUILD_SCRIPT_PATH
 )
 
 if(NOT BUILD_SCRIPT_PATH)
-    message(FATAL_ERROR "Could not find build_is_sdk.sh script. Please ensure inertial-sense-sdk is properly checked out.: ${CMAKE_CURRENT_SOURCE_DIR}: ${CMAKE_SOURCE_DIR}")
+    message(FATAL_ERROR "Could not find build_is_sdk.sh script. Please ensure inertial-sense-sdk is properly checked out.")
 endif()
 
 message(STATUS "Found build script at: ${BUILD_SCRIPT_PATH}")
 
-# FIXED: More reliable output directory and library path
-set(IS_SDK_BUILD_DIR "${CMAKE_BINARY_DIR}/inertial_sense_sdk")
-set(IS_SDK_LIB_PATH "${IS_SDK_BUILD_DIR}/libInertialSenseSDK.a")
+# FIXED: Determine SDK source directory and build paths
+get_filename_component(SDK_SOURCE_DIR "${BUILD_SCRIPT_PATH}/../.." ABSOLUTE)
+# FIXED: Check multiple possible library locations
+set(POSSIBLE_LIB_PATHS
+    "${SDK_SOURCE_DIR}/build/libInertialSenseSDK.a"
+    "${SDK_SOURCE_DIR}/libInertialSenseSDK.a"  
+    "${CMAKE_BINARY_DIR}/libInertialSenseSDK.a"
+)
 
-# FIXED: Create build directory and ensure script is executable
-file(MAKE_DIRECTORY ${IS_SDK_BUILD_DIR})
+# Find the actual library location after script execution
+foreach(lib_path ${POSSIBLE_LIB_PATHS})
+    if(EXISTS ${lib_path})
+        set(IS_SDK_LIB_PATH ${lib_path})
+        message(STATUS "Found existing library at: ${IS_SDK_LIB_PATH}")
+        break()
+    endif()
+endforeach()
+
+# If not found, use the default expected path
+if(NOT IS_SDK_LIB_PATH)
+    set(IS_SDK_LIB_PATH "${SDK_SOURCE_DIR}/build/libInertialSenseSDK.a")
+endif()
+
+message(STATUS "SDK source directory: ${SDK_SOURCE_DIR}")
+message(STATUS "Expected library path: ${IS_SDK_LIB_PATH}")
 
 add_custom_command(OUTPUT ${IS_SDK_LIB_PATH}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SDK_SOURCE_DIR}/build
     COMMAND ${CMAKE_COMMAND} -E env 
-        BUILD_DIR=${IS_SDK_BUILD_DIR}
+        PYTHON_VENV_PATH=""
         bash ${BUILD_SCRIPT_PATH}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} -E echo "Verifying library build..."
+    COMMAND test -f ${IS_SDK_LIB_PATH} || (echo "ERROR: libInertialSenseSDK.a not found at expected location ${IS_SDK_LIB_PATH}. Check build script output above." && exit 1)
+    WORKING_DIRECTORY ${SDK_SOURCE_DIR}
     COMMENT "Building Inertial Sense SDK..."
     VERBATIM
+    USES_TERMINAL
 )
 
 add_custom_target(build_InertialSenseSDK DEPENDS ${IS_SDK_LIB_PATH})
@@ -63,7 +86,7 @@ add_library(InertialSenseSDK STATIC IMPORTED GLOBAL)
 add_dependencies(InertialSenseSDK build_InertialSenseSDK)
 set_target_properties(InertialSenseSDK PROPERTIES 
     IMPORTED_LOCATION ${IS_SDK_LIB_PATH}
-    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../../src;${CMAKE_CURRENT_SOURCE_DIR}/shared/include"
+    INTERFACE_INCLUDE_DIRECTORIES "${SDK_SOURCE_DIR}/src;${CMAKE_CURRENT_SOURCE_DIR}/shared/include"
 )
 
 # Generate ROS2 interfaces
@@ -142,10 +165,10 @@ set_target_properties(${PROJECT_NAME}_node PROPERTIES
 
 # FIXED: Add target-specific include directories
 target_include_directories(${PROJECT_NAME}_node PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/libusb/libusb
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/libusb/linux
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/yaml-cpp
+    ${SDK_SOURCE_DIR}/src
+    ${SDK_SOURCE_DIR}/src/libusb/libusb
+    ${SDK_SOURCE_DIR}/src/libusb/linux
+    ${SDK_SOURCE_DIR}/src/yaml-cpp
     ${CMAKE_BINARY_DIR}/rosidl_generator_cpp/
 )
 
@@ -176,10 +199,10 @@ if(BUILD_TESTING)
         )
 
         target_include_directories(test_${PROJECT_NAME} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../src
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../src/libusb/libusb
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../src/libusb/linux
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../src/yaml-cpp
+            ${SDK_SOURCE_DIR}/src
+            ${SDK_SOURCE_DIR}/src/libusb/libusb
+            ${SDK_SOURCE_DIR}/src/libusb/linux
+            ${SDK_SOURCE_DIR}/src/yaml-cpp
             ${CMAKE_BINARY_DIR}/rosidl_generator_cpp/
         )
 
