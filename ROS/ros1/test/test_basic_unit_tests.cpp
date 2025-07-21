@@ -54,7 +54,7 @@ TEST(BasicTestSuite, test_rtk_rover)
     // This should also test composite configurations - ie, configuration parameters that when combined, set a single underlying parameter, ie ioConfigBits
 
     ASSERT_NE(isROS.RTK_rover_, nullptr);
-    RtkRoverProvider *p = isROS.RTK_rover_;
+    RtkRoverProvider *p = isROS.RTK_rover_.get();
     EXPECT_EQ(p->enable, true);
     EXPECT_EQ(p->positioning_enable, true);
     EXPECT_EQ(p->compassing_enable, false);
@@ -215,7 +215,7 @@ TEST(BasicTestSuite, test_rtk_base)
     // This should also test composite configurations - ie, configuration parameters that when combined, set a single underlying parameter, ie ioConfigBits
 
     ASSERT_NE(isROS.RTK_base_, nullptr);
-    RtkBaseProvider *p = isROS.RTK_base_;
+    RtkBaseProvider *p = isROS.RTK_base_.get();
     EXPECT_EQ(p->enable, false);
     EXPECT_EQ(p->source_gps__serial0_, RtkBaseProvider::base_gps_source::GPS1);
     EXPECT_EQ(p->source_gps__serial1_, RtkBaseProvider::base_gps_source::OFF);

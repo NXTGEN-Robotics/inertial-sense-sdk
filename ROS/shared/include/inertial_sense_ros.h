@@ -37,6 +37,10 @@
 #ifdef ROS2
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <atomic>
+#include <memory>
+#include <chrono>
 #include "rclcpp/rclcpp/rclcpp.hpp"
 #include "rclcpp/rclcpp/timer.hpp"
 #include "rclcpp/rclcpp/time.hpp"
@@ -126,7 +130,33 @@ using namespace std::chrono_literals;
 
 class InertialSenseROS //: SerialListener
 {
-public:
+#ifdef ROS2
+private:
+    // Thread safety
+    mutable std::mutex data_mutex_;
+    mutable std::mutex connection_mutex_;
+    std::atomic<bool> data_streaming_{false};
+    std::atomic<uint64_t> data_packet_count_{0};
+    
+    // Connection management
+    enum class ConnectionState {
+        DISCONNECTED,
+        CONNECTING, 
+        CONNECTED,
+        ERROR,
+        RECONNECTING
+    };
+    
+    ConnectionState connection_state_ = ConnectionState::DISCONNECTED;
+    std::chrono::steady_clock::time_point last_connection_attempt_;
+    std::chrono::steady_clock::time_point last_data_received_;
+    int connection_retry_count_ = 0;
+    
+    static constexpr int MAX_RETRY_COUNT = 5;
+    static constexpr auto RECONNECT_DELAY = std::chrono::seconds(2);
+    static constexpr auto DATA_TIMEOUT = std::chrono::seconds(5);
+#endif
+    public:
     typedef enum
     {
         NMEA_GPGGA = 0x01,
@@ -141,9 +171,12 @@ public:
 
    ~InertialSenseROS() { terminate(); }
 
-    void initializeIS(bool configFlashParameters = true);
-    void initializeROS();
-    void initialize(bool configFlashParameters = true);
+    #ifdef ROS2
+        InertialSenseROS(rclcpp::Node::SharedPtr external_node, YAML::Node paramNode, bool configFlashParameters=false);
+    #endif
+
+    bool initializeIS(bool configFlashParameters = true);    void initializeROS();
+    bool initialize(bool configFlashParameters = true);
     void terminate();
 
     void callback(p_data_t *data);
@@ -173,6 +206,22 @@ public:
     void flash_config_callback(eDataIDs DID, const nvm_flash_cfg_t *const msg);
     void setRefLla(const double refLla[3]);
 
+    #ifdef ROS2
+    // Enhanced connection management
+    bool verify_device_connection();
+    void handle_connection_loss();
+    void monitor_data_health();
+    
+    // Data validation
+    bool validate_gps_data(const gps_pos_t* msg);
+    bool validate_imu_data(const pimu_t* msg);
+    bool validate_ins_data(const ins_4_t* msg);
+    
+    // Safe publisher helpers
+    template<typename T>
+    void safe_publish(rclcpp::Publisher<T>::SharedPtr& pub, const T& msg);
+    #endif
+
     bool flashConfigStreaming_ = false;
     bool factory_reset_ = false;        // Apply factory reset on startup
 
@@ -188,6 +237,8 @@ public:
     bool setPlatformConfig_ = false;
 
     std::string frame_id_;
+
+    bool ros_initialized_ = false;
 
 #ifdef ROS1
     tf::TransformBroadcaster br;
@@ -238,8 +289,8 @@ public:
     GNSSObsVec gps2_obs_Vec_;
     GNSSObsVec base_obs_Vec_;
 #endif
-    RtkRoverProvider* RTK_rover_;
-    RtkBaseProvider* RTK_base_;
+    std::unique_ptr<RtkRoverProvider> RTK_rover_;
+    std::unique_ptr<RtkBaseProvider> RTK_base_;
 
     bool GNSS_Compass_ = false;
 

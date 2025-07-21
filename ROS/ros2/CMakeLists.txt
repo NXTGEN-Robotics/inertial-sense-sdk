@@ -178,6 +178,11 @@ target_link_libraries(${PROJECT_NAME}_node "${cpp_typesupport_target}")
 ament_target_dependencies(${PROJECT_NAME}_node rclcpp std_msgs geometry_msgs nav_msgs diagnostic_msgs sensor_msgs std_srvs)
 target_link_libraries(${PROJECT_NAME}_node InertialSenseSDK ${YAML_CPP_LIBRARIES} Threads::Threads)
 
+# FIXED: Install the executable with the name ROS2 is expecting
+install(TARGETS ${PROJECT_NAME}_node
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
 # FIXED: Conditional test building
 if(BUILD_TESTING)
     ament_add_gtest(test_${PROJECT_NAME}

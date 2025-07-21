@@ -62,62 +62,218 @@ InertialSenseROS::InertialSenseROS(YAML::Node paramNode, bool configFlashParamet
     load_params(paramNode);
 }
 
-void InertialSenseROS::initialize(bool configFlashParameters)
+InertialSenseROS::InertialSenseROS(rclcpp::Node::SharedPtr external_node, YAML::Node paramNode, bool configFlashParameters): nh_(external_node)
 {
-    RCLCPP_INFO(rclcpp::get_logger("start"),"======  Starting Inertial Sense ROS2  ======");
+    RCLCPP_INFO(nh_->get_logger(), "InertialSenseROS: Initializing from external node." );
 
-    initializeIS(true);
-    if (sdk_connected_)
-    {
-        initializeROS();
+    // Should always be enabled by default
+    rs_.did_ins1.enabled = true;
+    rs_.did_ins1.topic = "did_ins1";
+    rs_.gps1.enabled = true;
+    rs_.gps1.topic = "/gps";
 
-        if (log_enabled_) 
-        {
-            start_log();    // Start log should happen last
+    load_params(paramNode);
+}
+
+bool InertialSenseROS::initialize(bool configFlashParameters)
+{
+    try {
+        RCLCPP_INFO(nh_->get_logger(),"======  Starting Inertial Sense ROS2  ======");
+
+        // Check if hardware initialization succeeds
+        if (!initializeIS(configFlashParameters)) {
+            RCLCPP_ERROR(nh_->get_logger(), "Failed to initialize InertialSense hardware");
+            return false;
+        }
+        
+        // Verify we're actually connected
+        if (!sdk_connected_) {
+            RCLCPP_ERROR(nh_->get_logger(), "SDK not connected after initialization");
+            return false;
         }
 
-        // configure_ascii_output(); // Currently not functional
+        // Initialize logging if enabled
+        if (log_enabled_) {
+            try {
+                start_log();
+                RCLCPP_INFO(nh_->get_logger(), "Data logging started");
+            } catch (const std::exception& e) {
+                RCLCPP_WARN(nh_->get_logger(), "Failed to start logging: %s", e.what());
+                // Continue without logging - not critical
+            }
+        }
+        
+        // Set connection state
+        connection_state_ = ConnectionState::CONNECTED;
+        last_data_received_ = std::chrono::steady_clock::now();
+        
+        RCLCPP_INFO(nh_->get_logger(), "InertialSense ROS2 initialization completed successfully");
+        return true;
+        
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(nh_->get_logger(), "Exception during initialization: %s", e.what());
+        return false;
     }
 }
 
 void InertialSenseROS::terminate()
 {
-    IS_.Close();
-    IS_.CloseServerConnection();
-    sdk_connected_ = false;
-
-    // ROS equivalent to shutdown advertisers, etc.
+    try {
+        RCLCPP_INFO(nh_->get_logger(), "Terminating InertialSense driver...");
+        
+        // Stop timers first
+        if (obs_bundle_timer_) obs_bundle_timer_->cancel();
+        if (data_stream_timer_) data_stream_timer_->cancel();
+        if (diagnostics_timer_) diagnostics_timer_->cancel();
+        if (rtk_connectivity_watchdog_timer_) rtk_connectivity_watchdog_timer_->cancel();
+        
+        // Close connection
+        {
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            IS_.Close();
+            IS_.CloseServerConnection();
+        }
+        
+        sdk_connected_ = false;
+        connection_state_ = ConnectionState::DISCONNECTED;
+        
+        // Smart pointers will automatically clean up RTK providers
+        RTK_rover_.reset();
+        RTK_base_.reset();
+        
+        RCLCPP_INFO(nh_->get_logger(), "InertialSense driver terminated successfully");
+        
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(nh_->get_logger(), "Exception during termination: %s", e.what());
+    }
 }
 
-void InertialSenseROS::initializeIS(bool configFlashParameters)
+// HEADER FILE CHANGE (inertial_sense_ros.h):
+// FIND: void initializeIS(bool configFlashParameters = true);
+// REPLACE WITH:
+bool initializeIS(bool configFlashParameters = true);
+
+// IMPLEMENTATION FILE CHANGE (inertial_sense_ros.cpp):
+// FIND the entire initializeIS method (around line 95) and REPLACE with:
+
+bool InertialSenseROS::initializeIS(bool configFlashParameters)
 {
-    if (factory_reset_)
-    {
-        if (connect())
-        {   // Apply factory reset
-            RCLCPP_INFO(rclcpp::get_logger("factory_reset"), "InertialSenseROS2: Applying factory reset.");
+    try {
+        // Handle factory reset if requested
+        if (factory_reset_) {
+            RCLCPP_INFO(nh_->get_logger(), "InertialSenseROS2: Factory reset requested");
+            
+            if (!connect()) {
+                RCLCPP_ERROR(nh_->get_logger(), "Failed to connect for factory reset");
+                return false;
+            }
+            
+            try {
+                RCLCPP_INFO(nh_->get_logger(), "InertialSenseROS2: Applying factory reset.");
+                IS_.StopBroadcasts(true);
+                IS_.SetSysCmd(SYS_CMD_MANF_UNLOCK);
+                IS_.SetSysCmd(SYS_CMD_MANF_FACTORY_RESET);
+                
+                // Wait for reset to complete
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                
+                // Close and prepare for reconnection
+                IS_.Close();
+                sdk_connected_ = false;
+                
+                RCLCPP_INFO(nh_->get_logger(), "Factory reset completed, reconnecting...");
+                
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(nh_->get_logger(), "Exception during factory reset: %s", e.what());
+                return false;
+            }
+        }
+
+        // Main connection attempt
+        if (!connect()) {
+            RCLCPP_ERROR(nh_->get_logger(), "Failed to establish connection with device");
+            return false;
+        }
+
+        // Verify connection and check compatibility
+        if (!firmware_compatiblity_check()) {
+            RCLCPP_ERROR(nh_->get_logger(), "Firmware compatibility check failed");
+            IS_.Close();
+            sdk_connected_ = false;
+            return false;
+        }
+
+        // Stop any existing broadcasts
+        try {
             IS_.StopBroadcasts(true);
-            IS_.SetSysCmd(SYS_CMD_MANF_UNLOCK);
-            IS_.SetSysCmd(SYS_CMD_MANF_FACTORY_RESET);
-            sleep(3);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(nh_->get_logger(), "Warning stopping broadcasts: %s", e.what());
+            // Continue anyway - this is not critical
         }
-    }
 
-    if (connect())
-    {
-        // Check protocol and firmware version
-        firmware_compatiblity_check();
-
-        IS_.StopBroadcasts(true);
-        initializeROS();
-        configure_data_streams(true);
-        //configure_rtk();
-        IS_.SavePersistent();
-
-        if (configFlashParameters)
-        {   // Set IMX flash parameters (flash write) after everything else so processor stall doesn't interfere with communications.
-            //configure_flash_parameters();
+        // Initialize ROS components if not already done
+        if (!ros_initialized_) {
+            try {
+                initializeROS();
+                ros_initialized_ = true;
+                RCLCPP_INFO(nh_->get_logger(), "ROS components initialized");
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(nh_->get_logger(), "Failed to initialize ROS components: %s", e.what());
+                return false;
+            }
         }
+
+        // Configure data streams
+        try {
+            configure_data_streams(true);
+            RCLCPP_INFO(nh_->get_logger(), "Data streams configured");
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Failed to configure data streams: %s", e.what());
+            return false;
+        }
+
+        // Save persistent settings
+        try {
+            IS_.SavePersistent();
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(nh_->get_logger(), "Warning saving persistent settings: %s", e.what());
+            // Continue - this is not critical for basic operation
+        }
+
+        // Configure flash parameters if requested
+        if (configFlashParameters) {
+            try {
+                // Set IMX flash parameters (flash write) after everything else 
+                // so processor stall doesn't interfere with communications.
+                configure_flash_parameters();
+                RCLCPP_INFO(nh_->get_logger(), "Flash parameters configured");
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(nh_->get_logger(), "Failed to configure flash parameters: %s", e.what());
+                return false;
+            }
+        }
+
+        // RTK configuration (if enabled)
+        try {
+            configure_rtk();
+            RCLCPP_INFO(nh_->get_logger(), "RTK configuration completed");
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(nh_->get_logger(), "RTK configuration failed: %s", e.what());
+            // Continue - RTK failure shouldn't prevent basic operation
+        }
+
+        RCLCPP_INFO(nh_->get_logger(), "InertialSense hardware initialization successful");
+        return true;
+
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(nh_->get_logger(), "Exception in initializeIS: %s", e.what());
+        
+        // Cleanup on failure
+        if (sdk_connected_) {
+            IS_.Close();
+            sdk_connected_ = false;
+        }
+        return false;
     }
 }
 
@@ -211,12 +367,12 @@ void InertialSenseROS::load_params(YAML::Node &node)
 
     if (useParamSvr)
     {
-        RCLCPP_INFO(rclcpp::get_logger("load_config_ros_param"), "InertialSenseROS: Loading configuration from ROS Parameter Server." );
+        RCLCPP_INFO(nh_->get_logger(), "InertialSenseROS: Loading configuration from ROS Parameter Server." );
         ParamHelper::paramServerToYamlNode(node, "/");
     }
     else
     {
-        RCLCPP_INFO(rclcpp::get_logger("load_config_yaml"), "InertialSenseROS: Loading configuration from YAML tree." );
+        RCLCPP_INFO(nh_->get_logger(), "InertialSenseROS: Loading configuration from YAML tree." );
     }
 
     // Default values appear in the 3rd parameter
@@ -225,22 +381,70 @@ void InertialSenseROS::load_params(YAML::Node &node)
     // General parameters
     ParamHelper ph(node);
 
-    YAML::Node portNode = node["port"];
-    if (portNode.IsSequence()) {
-        for (auto it = portNode.begin(); it != portNode.end(); it++)
-            ports_.push_back((*it).as<std::string>());
-    } else if (portNode.IsScalar()) {
-        std::string param = nh_->declare_parameter<std::string>("port", "/dev/ttyACM0");
-        ph.nodeParam("port", param, param);
-        ports_.push_back(param);
+    // Add debugging after parameter loading:
+    auto logger = nh_->get_logger();
+
+    RCLCPP_INFO(logger, "=== SERIAL PORT DEBUG ===");
+    RCLCPP_INFO(logger, "Configured ports:");
+    
+    ports_.clear(); // Clear any existing ports
+    
+    if (!useParamSvr && node["port"]) {
+        // Using YAML file
+        YAML::Node portNode = node["port"];
+        if (portNode.IsSequence()) {
+            // Handle array of ports: port: ["/dev/ttyACM0", "/dev/ttyACM1"]
+            for (size_t i = 0; i < portNode.size(); i++) {
+                std::string current_port = portNode[i].as<std::string>();
+                ports_.push_back(current_port);
+                RCLCPP_INFO(logger, "YAML Port %zu: %s", i, current_port.c_str());
+            }
+        } else if (portNode.IsScalar()) {
+            // Handle single port: port: "/dev/ttyACM0"
+            std::string current_port = portNode.as<std::string>();
+            ports_.push_back(current_port);
+            RCLCPP_INFO(logger, "YAML Port 0: %s", current_port.c_str());
+        }
+    } else {
+        // Using ROS Parameter Server
+        try {
+            // Try to get port as string array first
+            std::vector<std::string> port_list;
+            if (nh_->has_parameter("port")) {
+                auto param_value = nh_->get_parameter("port");
+                
+                if (param_value.get_type() == rclcpp::ParameterType::PARAMETER_STRING_ARRAY) {
+                    port_list = param_value.as_string_array();
+                    for (size_t i = 0; i < port_list.size(); i++) {
+                        ports_.push_back(port_list[i]);
+                        RCLCPP_INFO(logger, "ROS Port %zu: %s", i, port_list[i].c_str());
+                    }
+                } else if (param_value.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+                    std::string single_port = param_value.as_string();
+                    ports_.push_back(single_port);
+                    RCLCPP_INFO(logger, "ROS Port 0: %s", single_port.c_str());
+                }
+            } else {
+                // Declare and get the parameter
+                auto port_param = nh_->declare_parameter<std::vector<std::string>>("port", {"/dev/ttyACM0"});
+                for (size_t i = 0; i < port_param.size(); i++) {
+                    ports_.push_back(port_param[i]);
+                    RCLCPP_INFO(logger, "ROS Default Port %zu: %s", i, port_param[i].c_str());
+                }
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(logger, "Error loading port parameter: %s", e.what());
+            // Fallback to default
+            ports_.push_back("/dev/ttyACM0");
+            RCLCPP_INFO(logger, "Fallback Port 0: /dev/ttyACM0");
+        }
     }
 
-    if(ports_.size() < 1)
-    {
-        //No ports specified. Use default
-        std::string param_1 = nh_->declare_parameter<std::string>("port_1", "/dev/ttyACM0");
-        ph.nodeParam("port_1", param_1, param_1);
-        ports_.push_back(param_1);
+    // Ensure we have at least one port
+    if (ports_.empty()) {
+        RCLCPP_WARN(logger, "No ports configured, using default");
+        ports_.push_back("/dev/ttyACM0");
+        RCLCPP_INFO(logger, "Default Port 0: /dev/ttyACM0");
     }
 
     bool factory_reset = nh_->declare_parameter<bool>("factory_reset", false);
@@ -444,12 +648,24 @@ void InertialSenseROS::load_params(YAML::Node &node)
     ph.nodeParam("cb_options", evb_.cb_options, evb_cb_options);
 
     YAML::Node rtkRoverNode = ph.node(node, "rtk_rover");
-    if (rtkRoverNode.IsDefined() && !rtkRoverNode.IsNull())
-        RTK_rover_ = new RtkRoverProvider(rtkRoverNode);
+    if (rtkRoverNode.IsDefined() && !rtkRoverNode.IsNull()) {
+        try {
+            RTK_rover_ = std::make_unique<RtkRoverProvider>(rtkRoverNode);
+            RCLCPP_INFO(nh_->get_logger(), "RTK Rover provider initialized");
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Failed to initialize RTK Rover: %s", e.what());
+        }
+    }
 
     YAML::Node rtkBaseNode = ph.node(node, "rtk_base");
-    if (rtkBaseNode.IsDefined() && !rtkBaseNode.IsNull())
-        RTK_base_ = new RtkBaseProvider(rtkBaseNode);
+    if (rtkBaseNode.IsDefined() && !rtkBaseNode.IsNull()) {
+        try {
+            RTK_base_ = std::make_unique<RtkBaseProvider>(rtkBaseNode);
+            RCLCPP_INFO(nh_->get_logger(), "RTK Base provider initialized");
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Failed to initialize RTK Base: %s", e.what());
+        }
+    }
 
     YAML::Node diagNode = ph.node(node, "diagnostics");
     bool rs_diagnostics_enabled = nh_->declare_parameter<bool>("msg/diagnostics/enable", false);
@@ -458,6 +674,16 @@ void InertialSenseROS::load_params(YAML::Node &node)
     // Print entire yaml node tree
      //printf("Node Tree:\n");
      //std::cout << node << "\n\n=====================  EXIT  =====================\n\n";
+
+    // Log loaded configuration summary
+    RCLCPP_INFO(logger, "Configuration Summary:");
+    RCLCPP_INFO(logger, "  Ports: %zu configured", ports_.size());
+    for (size_t i = 0; i < ports_.size(); i++) {
+        RCLCPP_INFO(logger, "    [%zu]: %s", i, ports_[i].c_str());
+    }
+    RCLCPP_INFO(logger, "  Baudrate: %d", baudrate_);
+    RCLCPP_INFO(logger, "  Frame ID: %s", frame_id_.c_str());
+    RCLCPP_INFO(logger, "  Enable Log: %s", log_enabled_ ? "true" : "false");
 
     // exit(1);
 }
@@ -470,7 +696,7 @@ void InertialSenseROS::configure_data_streams()
 
 #define CONFIG_STREAM(stream, did, type, cb_fun) \
     if((stream.enabled) && !(stream.streaming)){ \
-        rclcpp::Logger logger_conf_str = rclcpp::get_logger("config_stream"); \
+        rclcpp::Logger logger_conf_str = nh_->get_logger(); \
         logger_conf_str.set_level(rclcpp::Logger::Level::Debug); \
         RCLCPP_DEBUG(logger_conf_str,"InertialSenseROS: Attempting to enable %s (%d) data stream", cISDataMappings::DataName(did), did); \
         SET_CALLBACK(did, type, cb_fun, stream.period); \
@@ -480,7 +706,7 @@ void InertialSenseROS::configure_data_streams()
 
 #define CONFIG_STREAM_GPS(stream, did_pos, cb_fun_pos, did_vel, cb_fun_vel) \
     if((stream.enabled) && !(stream.streaming_pos)){ \
-        rclcpp::Logger logger_conf_str_gps_pos = rclcpp::get_logger("config_stream_gps_pos"); \
+        rclcpp::Logger logger_conf_str_gps_pos = nh_->get_logger(); \
         logger_conf_str_gps_pos.set_level(rclcpp::Logger::Level::Debug); \
         RCLCPP_DEBUG(logger_conf_str_gps_pos,"InertialSenseROS: Attempting to enable %s (%d) data stream", cISDataMappings::DataName(did_pos), did_pos); \
         SET_CALLBACK(did_pos, gps_pos_t, cb_fun_pos, stream.period); \
@@ -488,7 +714,7 @@ void InertialSenseROS::configure_data_streams()
             return; \
     } \
     if((stream.enabled) && !(stream.streaming_vel)){ \
-        rclcpp::Logger logger_conf_str_gps_vel = rclcpp::get_logger("config_stream_gps_vel"); \
+        rclcpp::Logger logger_conf_str_gps_vel = nh_->get_logger(); \
         logger_conf_str_gps_vel.set_level(rclcpp::Logger::Level::Debug); \
         RCLCPP_DEBUG(logger_conf_str_gps_vel,"InertialSenseROS: Attempting to enable %s (%d) data stream", cISDataMappings::DataName(did_vel), did_vel); \
         SET_CALLBACK(did_vel, gps_vel_t, cb_fun_vel, stream.period); \
@@ -500,14 +726,14 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 {
     if (!rs_.gps1.streaming_pos) // we always need GPS for Fix status
     {
-        rclcpp::Logger logger_gps1pos = rclcpp::get_logger("gps1_pos");
+        rclcpp::Logger logger_gps1pos = nh_->get_logger();
         logger_gps1pos.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_gps1pos,"InertialSenseROS: Attempting to enable GPS1 Pos data stream");
         SET_CALLBACK(DID_GPS1_POS, gps_pos_t, GPS_pos_callback, rs_.gps1.period);
     }
     if (!flashConfigStreaming_)
     {
-        rclcpp::Logger logger_flash_conf = rclcpp::get_logger("flash_config");
+        rclcpp::Logger logger_flash_conf = nh_->get_logger();
         logger_flash_conf.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_flash_conf,"InertialSenseROS: Attempting to enable flash config data stream");
         SET_CALLBACK(DID_FLASH_CONFIG, nvm_flash_cfg_t, flash_config_callback, 0);
@@ -517,7 +743,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 
     if (rs_.odom_ins_ned.enabled && !(rs_.did_ins4.streaming && imuStreaming_))
     {
-        rclcpp::Logger logger_odom_ins_ned = rclcpp::get_logger("odom_ins_ned");
+        rclcpp::Logger logger_odom_ins_ned = nh_->get_logger();
         logger_odom_ins_ned.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_odom_ins_ned,"InertialSenseROS: Attempting to enable odom INS NED data stream");
 
@@ -531,7 +757,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 
     if (rs_.odom_ins_ecef.enabled && !(rs_.did_ins4.streaming && imuStreaming_))
     {
-        rclcpp::Logger logger_odom_ins_ecef = rclcpp::get_logger("odom_ins_ecef");
+        rclcpp::Logger logger_odom_ins_ecef = nh_->get_logger();
         logger_odom_ins_ecef.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_odom_ins_ecef,"InertialSenseROS: Attempting to enable odom INS ECEF data stream");
         SET_CALLBACK(DID_INS_4, ins_4_t, INS4_callback, rs_.did_ins4.period);                     // Need quaternion and ecef
@@ -544,7 +770,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 
     if (rs_.odom_ins_enu.enabled  && !(rs_.did_ins4.streaming && imuStreaming_))
     {
-        rclcpp::Logger logger_odom_ins_enu = rclcpp::get_logger("odom_ins_enu");
+        rclcpp::Logger logger_odom_ins_enu = nh_->get_logger();
         logger_odom_ins_enu.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_odom_ins_enu,"InertialSenseROS: Attempting to enable odom INS ENU data stream");
         SET_CALLBACK(DID_INS_4, ins_4_t, INS4_callback, rs_.did_ins4.period);                     // Need ENU
@@ -557,7 +783,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
 
     if (covariance_enabled_ && !insCovarianceStreaming_)
     {
-        rclcpp::Logger logger_covariance = rclcpp::get_logger("covariance_stream");
+        rclcpp::Logger logger_covariance = nh_->get_logger();
         logger_covariance.set_level(rclcpp::Logger::Level::Debug);
         RCLCPP_DEBUG(logger_covariance, "InertialSenseROS: Attempting to enable %s data stream", cISDataMappings::DataName(DID_ROS_COVARIANCE_POSE_TWIST));
         SET_CALLBACK(DID_ROS_COVARIANCE_POSE_TWIST, ros_covariance_pose_twist_t, INS_covariance_callback, 200);
@@ -573,7 +799,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
     if (!NavSatFixConfigured)
     {
         if (rs_.gps1_navsatfix.enabled) {
-            rclcpp::Logger logger_nsfgps1 = rclcpp::get_logger("enable_nav_sat_fix_gps1");
+            rclcpp::Logger logger_nsfgps1 = nh_->get_logger();
             logger_nsfgps1.set_level(rclcpp::Logger::Level::Debug);
             RCLCPP_DEBUG(logger_nsfgps1,"InertialSenseROS: Attempting to enable gps1/NavSatFix");
             // Satellite system constellation used in GNSS solution.  (see eGnssSatSigConst) 0x0003=GPS, 0x000C=QZSS, 0x0030=Galileo, 0x00C0=Beidou, 0x0300=GLONASS, 0x1000=SBAS
@@ -593,7 +819,7 @@ void InertialSenseROS::configure_data_streams(bool firstrun) // if firstrun is t
             }
         }
         if (rs_.gps2_navsatfix.enabled) {
-            rclcpp::Logger logger_nsfgps2 = rclcpp::get_logger("enable_nav_sat_fix_gps2");
+            rclcpp::Logger logger_nsfgps2 = nh_->get_logger();
             logger_nsfgps2.set_level(rclcpp::Logger::Level::Debug);
             RCLCPP_DEBUG(logger_nsfgps2,"InertialSenseROS: Attempting to enable gps2/NavSatFix");
             // Satellite system constellation used in GNSS solution.  (see eGnssSatSigConst) 0x0003=GPS, 0x000C=QZSS, 0x0030=Galileo, 0x00C0=Beidou, 0x0300=GLONASS, 0x1000=SBAS
@@ -675,29 +901,86 @@ void InertialSenseROS::configure_ascii_output()
  */
 bool InertialSenseROS::connect(float timeout)
 {
-    uint32_t end_time = nh_->now().seconds() + timeout;
-    auto ports_iterator = ports_.begin();
+    if (ports_.empty()) {
+        RCLCPP_ERROR(nh_->get_logger(), "No serial ports configured");
+        return false;
+    }
+    
+    connection_state_ = ConnectionState::CONNECTING;
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout_duration = std::chrono::duration<float>(timeout);
 
-    do {
-        std::string cur_port = *ports_iterator;
-        /// Connect to the IMX
-        RCLCPP_INFO(rclcpp::get_logger("connect_to_serial"),"InertialSenseROS: Connecting to serial port \"%s\", at %d baud", cur_port.c_str(), baudrate_);
-        sdk_connected_ = IS_.Open(cur_port.c_str(), baudrate_);
-        if (!sdk_connected_) {
-            RCLCPP_ERROR(rclcpp::get_logger("open_port_error"),"InertialSenseROS: Unable to open serial port \"%s\", at %d baud", cur_port.c_str(), baudrate_);
-            sleep(1); // is this a good idea?
-        } else {
-            RCLCPP_INFO(rclcpp::get_logger("serial_port_connected_info"),"InertialSenseROS: Connected to IMX SN%d on \"%s\", at %d baud", IS_.DeviceInfo().serialNumber, cur_port.c_str(), baudrate_);
-            port_ = cur_port;
+    for (const auto& port : ports_) {
+        if (std::chrono::steady_clock::now() - start_time > timeout_duration) {
             break;
         }
-        if ((ports_.size() > 1) && (ports_iterator != ports_.end()))
-            ports_iterator++;
-        else
-            ports_iterator = ports_.begin(); // just keep looping until we timeout below
-    } while (nh_->now().seconds() < end_time);
+        
+        RCLCPP_INFO(nh_->get_logger(), "Attempting connection to %s at %d baud", port.c_str(), baudrate_);
+        
+        try {
+            sdk_connected_ = IS_.Open(port.c_str(), baudrate_);
+            if (sdk_connected_) {
+                port_ = port;
+                connection_retry_count_ = 0;
+                
+                // Verify connection with device info
+                if (!verify_device_connection()) {
+                    RCLCPP_WARN(nh_->get_logger(), "Device verification failed for %s", port.c_str());
+                    IS_.Close();
+                    sdk_connected_ = false;
+                    continue;
+                }
+                
+                RCLCPP_INFO(nh_->get_logger(), "Connected to IMX SN%d on %s", 
+                           IS_.DeviceInfo().serialNumber, port.c_str());
+                connection_state_ = ConnectionState::CONNECTED;
+                return true;
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Exception connecting to %s: %s", port.c_str(), e.what());
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
 
-    return sdk_connected_;
+    connection_state_ = ConnectionState::ERROR;
+    RCLCPP_ERROR(nh_->get_logger(), "Failed to connect to any configured port");
+    return false;
+}
+
+bool InertialSenseROS::verify_device_connection()
+{
+    auto start = std::chrono::steady_clock::now();
+    constexpr auto info_timeout = std::chrono::seconds(3);
+    
+    while (std::chrono::steady_clock::now() - start < info_timeout) {
+        IS_.Update();
+        if (IS_.DeviceInfo().serialNumber != 0) {
+            return firmware_compatiblity_check();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    RCLCPP_WARN(nh_->get_logger(), "Timeout waiting for device info");
+    return false;
+}
+
+void InertialSenseROS::handle_connection_loss()
+{
+    if (connection_state_ != ConnectionState::CONNECTED) {
+        return;
+    }
+    
+    RCLCPP_WARN(nh_->get_logger(), "Connection lost, attempting reconnection");
+    connection_state_ = ConnectionState::RECONNECTING;
+    
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        IS_.Close();
+        sdk_connected_ = false;
+    }
+    
+    last_connection_attempt_ = std::chrono::steady_clock::now();
 }
 
 bool InertialSenseROS::firmware_compatiblity_check()
@@ -1102,34 +1385,48 @@ void InertialSenseROS::setRefLla(const double refLla[3])
 
 void InertialSenseROS::INS1_callback(eDataIDs DID, const ins_1_t *const msg)
 {
+    if (!msg) {
+        RCLCPP_WARN(nh_->get_logger(), "Null INS1 message received");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    data_packet_count_++;
+    last_data_received_ = std::chrono::steady_clock::now();
+    
     rs_.did_ins1.streamingCheck(DID);
 
-    // Standard DID_INS_1 message
-    if (rs_.did_ins1.enabled)
-    {
-        msg_did_ins1.header.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeek);
-        msg_did_ins1.header.frame_id = frame_id_;
-        msg_did_ins1.week = msg->week;
-        msg_did_ins1.time_of_week = msg->timeOfWeek;
-        msg_did_ins1.ins_status = msg->insStatus;
-        msg_did_ins1.hdw_status = msg->hdwStatus;
-        msg_did_ins1.theta[0] = msg->theta[0];
-        msg_did_ins1.theta[1] = msg->theta[1];
-        msg_did_ins1.theta[2] = msg->theta[2];
-        msg_did_ins1.uvw[0] = msg->uvw[0];
-        msg_did_ins1.uvw[1] = msg->uvw[1];
-        msg_did_ins1.uvw[2] = msg->uvw[2];
-        msg_did_ins1.lla[0] = msg->lla[0];
-        msg_did_ins1.lla[1] = msg->lla[1];
-        msg_did_ins1.lla[2] = msg->lla[2];
-        msg_did_ins1.ned[0] = msg->ned[0];
-        msg_did_ins1.ned[1] = msg->ned[1];
-        msg_did_ins1.ned[2] = msg->ned[2];
-       if(rs_.did_ins1.pub_didins1 != NULL) {
-           if (rs_.did_ins1.pub_didins1->get_subscription_count() > 0)
-               rs_.did_ins1.pub_didins1->publish(msg_did_ins1);
-       }
-
+    if (rs_.did_ins1.enabled) {
+        try {
+            msg_did_ins1.header.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeek);
+            msg_did_ins1.header.frame_id = frame_id_;
+            msg_did_ins1.week = msg->week;
+            msg_did_ins1.time_of_week = msg->timeOfWeek;
+            msg_did_ins1.ins_status = msg->insStatus;
+            msg_did_ins1.hdw_status = msg->hdwStatus;
+            
+            // Validate and copy data
+            for (int i = 0; i < 3; i++) {
+                if (std::isfinite(msg->theta[i]) && std::isfinite(msg->uvw[i]) && 
+                    std::isfinite(msg->lla[i]) && std::isfinite(msg->ned[i])) {
+                    msg_did_ins1.theta[i] = msg->theta[i];
+                    msg_did_ins1.uvw[i] = msg->uvw[i];
+                    msg_did_ins1.lla[i] = msg->lla[i];
+                    msg_did_ins1.ned[i] = msg->ned[i];
+                } else {
+                    RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 1000,
+                                         "Non-finite value in INS1 data at index %d", i);
+                    return;
+                }
+            }
+            
+            // Safe publishing
+            if (rs_.did_ins1.pub_didins1) {
+                safe_publish(rs_.did_ins1.pub_didins1, msg_did_ins1);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Exception in INS1 callback: %s", e.what());
+        }
     }
 }
 
@@ -1541,40 +1838,58 @@ void InertialSenseROS::INS_covariance_callback(eDataIDs DID, const ros_covarianc
     }
 }
 
-
 void InertialSenseROS::GPS_pos_callback(eDataIDs DID, const gps_pos_t *const msg)
 {
-    static eDataIDs primaryGpsDid = DID_GPS2_POS;  // Use GPS2 if GPS1 is disabled
+    if (!validate_gps_data(msg)) {
+        RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 5000,
+                             "Invalid GPS position data received");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    data_packet_count_++;
+    last_data_received_ = std::chrono::steady_clock::now();
+    
+    static eDataIDs primaryGpsDid = DID_GPS2_POS;
 
-    switch (DID)
-    {
+    switch (DID) {
     case DID_GPS1_POS:
         rs_.gps1.streamingCheck(DID, rs_.gps1.streaming_pos);
         gps1_pos = *msg;
         primaryGpsDid = DID;
 
-        if (rs_.gps1.enabled && msg->status & GPS_STATUS_FIX_MASK)
-        {
-            msg_gps1.header.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeekMs / 1.0e3);
-            msg_gps1.week = msg->week;
-            msg_gps1.status = msg->status;
-            msg_gps1.header.frame_id = frame_id_;
-            msg_gps1.num_sat = (uint8_t)(msg->status & GPS_STATUS_NUM_SATS_USED_MASK);
-            msg_gps1.cno = msg->cnoMean;
-            msg_gps1.latitude = msg->lla[0];
-            msg_gps1.longitude = msg->lla[1];
-            msg_gps1.altitude = msg->lla[2];
-            msg_gps1.pos_ecef.x = ecef_[0] = msg->ecef[0];
-            msg_gps1.pos_ecef.y = ecef_[1] = msg->ecef[1];
-            msg_gps1.pos_ecef.z = ecef_[2] = msg->ecef[2];
-            msg_gps1.hmsl = msg->hMSL;
-            msg_gps1.hacc = msg->hAcc;
-            msg_gps1.vacc = msg->vAcc;
-            msg_gps1.pdop = msg->pDop;
-            publishGPS1();
+        if (rs_.gps1.enabled && (msg->status & GPS_STATUS_FIX_MASK)) {
+            try {
+                msg_gps1.header.stamp = ros_time_from_week_and_tow(msg->week, msg->timeOfWeekMs / 1.0e3);
+                msg_gps1.week = msg->week;
+                msg_gps1.status = msg->status;
+                msg_gps1.header.frame_id = frame_id_;
+                msg_gps1.num_sat = (uint8_t)(msg->status & GPS_STATUS_NUM_SATS_USED_MASK);
+                msg_gps1.cno = msg->cnoMean;
+                
+                // Validate coordinates before assignment
+                if (std::isfinite(msg->lla[0]) && std::isfinite(msg->lla[1]) && std::isfinite(msg->lla[2])) {
+                    msg_gps1.latitude = msg->lla[0];
+                    msg_gps1.longitude = msg->lla[1];
+                    msg_gps1.altitude = msg->lla[2];
+                } else {
+                    RCLCPP_WARN(nh_->get_logger(), "Non-finite GPS coordinates received");
+                    return;
+                }
+                
+                msg_gps1.pos_ecef.x = ecef_[0] = msg->ecef[0];
+                msg_gps1.pos_ecef.y = ecef_[1] = msg->ecef[1];
+                msg_gps1.pos_ecef.z = ecef_[2] = msg->ecef[2];
+                msg_gps1.hmsl = msg->hMSL;
+                msg_gps1.hacc = msg->hAcc;
+                msg_gps1.vacc = msg->vAcc;
+                msg_gps1.pdop = msg->pDop;
+                publishGPS1();
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(nh_->get_logger(), "Exception in GPS1 processing: %s", e.what());
+            }
         }
         break;
-
     case DID_GPS2_POS:
         rs_.gps2.streamingCheck(DID, rs_.gps2.streaming_pos);
         gps2_pos = *msg;
@@ -1687,14 +2002,14 @@ void InertialSenseROS::publishGPS1()
     {
         msg_gps1.vel_ecef = gps1_velEcef.vector;
         msg_gps1.sacc = gps1_vel.sAcc;
-        if (rs_.gps1.pub_gps == NULL) {
-            initialize();
+        
+        // SAFE PUBLISHING with null check:
+        if (rs_.gps1.pub_gps) {
+            safe_publish(rs_.gps1.pub_gps, msg_gps1);
+        } else {
+            RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 5000,
+                                 "GPS1 publisher not initialized");
         }
-        if (rs_.gps1.pub_gps != NULL) {
-            if (rs_.gps1.pub_gps->get_subscription_count() > 0)
-                rs_.gps1.pub_gps->publish(msg_gps1);
-        }
-
     }
 }
 
@@ -1705,24 +2020,74 @@ void InertialSenseROS::publishGPS2()
     {
         msg_gps2.vel_ecef = gps2_velEcef.vector;
         msg_gps2.sacc = gps2_vel.sAcc;
-        if (rs_.gps2.pub_gps != NULL) {
-            if (rs_.gps2.pub_gps->get_subscription_count() > 0)
-                rs_.gps2.pub_gps->publish(msg_gps2);
+        
+        // SAFE PUBLISHING with null check:
+        if (rs_.gps2.pub_gps) {
+            safe_publish(rs_.gps2.pub_gps, msg_gps2);
+        } else {
+            RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 5000,
+                                 "GPS2 publisher not initialized");
         }
-
     }
 }
 
+
 void InertialSenseROS::update()
 {
-    if (!IS_.IsOpen()) {
-        IS_.Close();
-        sdk_connected_ = false;
-        sleep(1);
-        initializeIS();
+    auto now = std::chrono::steady_clock::now();
+    
+    switch (connection_state_) {
+        case ConnectionState::CONNECTED:
+            {
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                if (!IS_.IsOpen()) {
+                    handle_connection_loss();
+                    return;
+                }
+                
+                // Check for data timeout
+                if (now - last_data_received_ > DATA_TIMEOUT) {
+                    RCLCPP_WARN(nh_->get_logger(), "Data timeout detected");
+                    handle_connection_loss();
+                    return;
+                }
+                
+                try {
+                    IS_.Update();
+                    monitor_data_health();
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(nh_->get_logger(), "Update exception: %s", e.what());
+                    handle_connection_loss();
+                }
+            }
+            break;
+            
+        case ConnectionState::RECONNECTING:
+            if (now - last_connection_attempt_ > RECONNECT_DELAY && 
+                connection_retry_count_ < MAX_RETRY_COUNT) {
+                
+                connection_retry_count_++;
+                RCLCPP_INFO(nh_->get_logger(), "Reconnection attempt %d/%d", 
+                           connection_retry_count_, MAX_RETRY_COUNT);
+                
+                if (connect(5.0f)) {
+                    configure_data_streams(true);
+                } else {
+                    last_connection_attempt_ = now;
+                }
+            } else if (connection_retry_count_ >= MAX_RETRY_COUNT) {
+                RCLCPP_ERROR(nh_->get_logger(), "Max reconnection attempts reached");
+                connection_state_ = ConnectionState::ERROR;
+            }
+            break;
+            
+        case ConnectionState::ERROR:
+            // Could implement exponential backoff here
+            break;
+            
+        default:
+            break;
     }
-
-    IS_.Update();
 }
 
 void InertialSenseROS::strobe_in_time_callback(eDataIDs DID, const strobe_in_time_t *const msg)
@@ -1811,38 +2176,59 @@ void InertialSenseROS::baro_callback(eDataIDs DID, const barometer_t *const msg)
 
 void InertialSenseROS::preint_IMU_callback(eDataIDs DID, const pimu_t *const msg)
 {
+    if (!validate_imu_data(msg)) {
+        RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 1000,
+                             "Invalid IMU data received");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    data_packet_count_++;
+    last_data_received_ = std::chrono::steady_clock::now();
     imuStreaming_ = true;
 
-    if (rs_.pimu.enabled)
-    {
+    if (rs_.pimu.enabled) {
         rs_.pimu.streamingCheck(DID);
-        msg_pimu.header.stamp = ros_time_from_start_time(msg->time);
-        msg_pimu.header.frame_id = frame_id_;
-        msg_pimu.dtheta.x = msg->theta[0];
-        msg_pimu.dtheta.y = msg->theta[1];
-        msg_pimu.dtheta.z = msg->theta[2];
-        msg_pimu.dvel.x = msg->vel[0];
-        msg_pimu.dvel.y = msg->vel[1];
-        msg_pimu.dvel.z = msg->vel[2];
-        msg_pimu.dt = msg->dt;
-        rs_.pimu.pub_pimu->publish(msg_pimu);
+        try {
+            msg_pimu.header.stamp = ros_time_from_start_time(msg->time);
+            msg_pimu.header.frame_id = frame_id_;
+            msg_pimu.dtheta.x = msg->theta[0];
+            msg_pimu.dtheta.y = msg->theta[1];
+            msg_pimu.dtheta.z = msg->theta[2];
+            msg_pimu.dvel.x = msg->vel[0];
+            msg_pimu.dvel.y = msg->vel[1];
+            msg_pimu.dvel.z = msg->vel[2];
+            msg_pimu.dt = msg->dt;
+            
+            if (rs_.pimu.pub_pimu) {
+                safe_publish(rs_.pimu.pub_pimu, msg_pimu);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Exception in PIMU callback: %s", e.what());
+        }
     }
 
-    if (rs_.imu.enabled)
-    {
+    if (rs_.imu.enabled) {
         rs_.imu.streamingCheck(DID);
-        msg_imu.header.stamp = ros_time_from_start_time(msg->time);
-        msg_imu.header.frame_id = frame_id_;
-        if (msg->dt != 0.0f)
-        {
-            float div = 1.0f/msg->dt;
-            msg_imu.angular_velocity.x = msg->theta[0]  * div;
-            msg_imu.angular_velocity.y = msg->theta[1]  * div;
-            msg_imu.angular_velocity.z = msg->theta[2]  * div;
-            msg_imu.linear_acceleration.x = msg->vel[0] * div;
-            msg_imu.linear_acceleration.y = msg->vel[1] * div;
-            msg_imu.linear_acceleration.z = msg->vel[2] * div;
-            rs_.imu.pub_imu->publish(msg_imu);
+        try {
+            msg_imu.header.stamp = ros_time_from_start_time(msg->time);
+            msg_imu.header.frame_id = frame_id_;
+            
+            if (msg->dt != 0.0f) {
+                float div = 1.0f/msg->dt;
+                msg_imu.angular_velocity.x = msg->theta[0] * div;
+                msg_imu.angular_velocity.y = msg->theta[1] * div;
+                msg_imu.angular_velocity.z = msg->theta[2] * div;
+                msg_imu.linear_acceleration.x = msg->vel[0] * div;
+                msg_imu.linear_acceleration.y = msg->vel[1] * div;
+                msg_imu.linear_acceleration.z = msg->vel[2] * div;
+                
+                if (rs_.imu.pub_imu) {
+                    safe_publish(rs_.imu.pub_imu, msg_imu);
+                }
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Exception in IMU callback: %s", e.what());
         }
     }
 }
@@ -2584,4 +2970,75 @@ void InertialSenseROS::transform_6x6_covariance(float Pout[36], float Pin[36], i
     }
 }
 
+bool InertialSenseROS::validate_gps_data(const gps_pos_t* msg)
+{
+    if (!msg) return false;
+    
+    // Check for reasonable latitude/longitude ranges
+    if (std::abs(msg->lla[0]) > M_PI/2 || std::abs(msg->lla[1]) > M_PI) {
+        return false;
+    }
+    
+    // Check for reasonable altitude
+    if (msg->lla[2] < -1000.0 || msg->lla[2] > 50000.0) {
+        return false;
+    }
+    
+    // Check for valid status
+    return (msg->status & GPS_STATUS_FIX_MASK) >= GPS_STATUS_FIX_2D;
+}
 
+bool InertialSenseROS::validate_imu_data(const pimu_t* msg)
+{
+    if (!msg) return false;
+    
+    // Check for reasonable accelerometer values (< 50g)
+    for (int i = 0; i < 3; i++) {
+        if (std::abs(msg->vel[i] / msg->dt) > 500.0) {
+            return false;
+        }
+    }
+    
+    // Check for reasonable gyro values (< 2000 deg/s)
+    for (int i = 0; i < 3; i++) {
+        if (std::abs(msg->theta[i] / msg->dt) > 35.0) {
+            return false;
+        }
+    }
+    
+    return msg->dt > 0.0 && msg->dt < 1.0;
+}
+
+template<typename T>
+void InertialSenseROS::safe_publish(rclcpp::Publisher<T>::SharedPtr& pub, const T& msg)
+{
+    if (pub && pub->get_subscription_count() > 0) {
+        try {
+            pub->publish(msg);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(nh_->get_logger(), "Exception publishing message: %s", e.what());
+        }
+    }
+}
+
+void InertialSenseROS::monitor_data_health()
+{
+    static auto last_check = std::chrono::steady_clock::now();
+    static uint64_t last_packet_count = 0;
+    
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_check > std::chrono::seconds(5)) {
+        uint64_t current_count = data_packet_count_.load();
+        uint64_t packets_received = current_count - last_packet_count;
+        
+        if (packets_received == 0 && data_streaming_) {
+            RCLCPP_WARN(nh_->get_logger(), "No data packets received in last 5 seconds");
+        } else if (packets_received > 0) {
+            RCLCPP_DEBUG(nh_->get_logger(), "Data rate: %lu packets/5s", packets_received);
+            data_streaming_ = true;
+        }
+        
+        last_packet_count = current_count;
+        last_check = now;
+    }
+}
